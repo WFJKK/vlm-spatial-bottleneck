@@ -41,11 +41,11 @@ LOG_FILE = "training_log.jsonl"
 LORA_RANK = 64
 LORA_ALPHA = 128
 
-# GRPO hyperparameters
-NUM_GENERATIONS = 8          # Samples per prompt
+# GRPO hyperparameters (sized for ~4hr training on A100 80GB)
+NUM_GENERATIONS = 4          # Samples per prompt (4 not 8 to fit time budget)
 MAX_NEW_TOKENS = 32          # Answer-only: just a number
 LEARNING_RATE = 5e-6
-NUM_TRAIN_EPOCHS = 3
+NUM_TRAIN_EPOCHS = 1         # 1 epoch — enough to see if MAE moves
 PER_DEVICE_BATCH_SIZE = 1
 GRADIENT_ACCUMULATION_STEPS = 8
 SAVE_STEPS = 50

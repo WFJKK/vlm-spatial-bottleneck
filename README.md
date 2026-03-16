@@ -102,6 +102,15 @@ Continuous relative error: `reward = -abs(predicted - ground_truth) / ground_tru
 Continuous (not stepwise) to preserve full ranking information for GRPO's
 group-relative advantage computation.
 
+## Time budget
+
+Designed for a 6-hour A100 80GB session:
+- Setup + dataset: 15 min
+- Baseline eval: 15 min
+- GRPO training: ~4 hrs (1 epoch, N=4 generations)
+- Post-training eval: 15 min
+- Push results: 5 min
+
 ## Known risks and TODO
 
 - [ ] TRL GRPOTrainer + Mistral VLM + vLLM colocate is untested — may need
