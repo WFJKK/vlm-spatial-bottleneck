@@ -50,7 +50,13 @@ def parse_number(text):
     return None
 
 
-def load_model(checkpoint_dir=None):
+def load_model(checkpoint_dir=None, sft_base=None):
+    """Load model with optional LoRA adapter.
+    
+    Args:
+        checkpoint_dir: Path to LoRA adapter to evaluate
+        sft_base: Path to SFT adapter to merge first (for SFT→RL evals)
+    """
     from transformers import AutoModelForImageTextToText, AutoProcessor
 
     print(f"Loading base model: {MODEL_ID}")
@@ -58,6 +64,14 @@ def load_model(checkpoint_dir=None):
         MODEL_ID, torch_dtype=torch.bfloat16, device_map="auto", trust_remote_code=True,
     )
 
+    # For SFT→RL: merge SFT adapter into base first
+    if sft_base and os.path.exists(sft_base):
+        from peft import PeftModel
+        print(f"Merging SFT base from {sft_base}")
+        model = PeftModel.from_pretrained(model, sft_base)
+        model = model.merge_and_unload()
+
+    # Apply evaluation adapter
     if checkpoint_dir and os.path.exists(checkpoint_dir):
         from peft import PeftModel
         print(f"Loading LoRA adapter from {checkpoint_dir}")
@@ -232,12 +246,12 @@ def compute_matched_metrics(pair_results):
     }
 
 
-def run_evaluation(checkpoint_dir, tag):
+def run_evaluation(checkpoint_dir, tag, sft_base=None):
     print(f"\n{'='*60}")
     print(f"  Evaluation: {tag}")
     print(f"{'='*60}\n")
 
-    model, processor = load_model(checkpoint_dir)
+    model, processor = load_model(checkpoint_dir, sft_base=sft_base)
 
     results_dir = Path(RESULTS_DIR) / tag
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -319,6 +333,8 @@ def main():
     parser.add_argument("--baseline", action="store_true")
     parser.add_argument("--checkpoint-dir", type=str, default=None)
     parser.add_argument("--tag", type=str, default=None)
+    parser.add_argument("--sft-base", type=str, default=None,
+                        help="SFT adapter to merge before loading checkpoint (for SFT→RL)")
     parser.add_argument("--compare", action="store_true")
     args = parser.parse_args()
 
@@ -328,7 +344,7 @@ def main():
         run_evaluation(checkpoint_dir=None, tag="baseline")
     elif args.checkpoint_dir:
         tag = args.tag or args.checkpoint_dir.replace("/", "_")
-        run_evaluation(checkpoint_dir=args.checkpoint_dir, tag=tag)
+        run_evaluation(checkpoint_dir=args.checkpoint_dir, tag=tag, sft_base=args.sft_base)
     else:
         parser.print_help()
 

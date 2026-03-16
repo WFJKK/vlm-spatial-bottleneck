@@ -1,16 +1,14 @@
-"""CoT GRPO for spatial measurement — bf16, memory-safe.
+"""GRPO starting from SFT checkpoint — the standard SFT→RL pipeline.
 
-Changes from the script that OOM'd:
-  1. bf16 (NOT 4-bit) — LoRA adapters match eval quantization
-  2. Per-completion backward — peak memory = ONE completion, not N
-  3. Gradient checkpointing — trades compute for memory
-  4. 128 max tokens — enough for brief reasoning + ANSWER: <number>
-  5. Memory sanity check before training starts
-  6. Graceful OOM recovery per step
+Loads base model, merges SFT LoRA adapter, applies fresh LoRA, then
+runs answer-only GRPO. This tests whether SFT's output precision
+combines with GRPO's spatial reasoning.
+
+Requires: checkpoints_sft/final from a previous SFT run.
 
 Usage:
-    python3 train_grpo_cot.py
-    python3 train_grpo_cot.py --resume
+    python3 train_grpo_from_sft.py
+    python3 train_grpo_from_sft.py --resume
 """
 
 import json, os, re, time, gc
@@ -19,17 +17,18 @@ from pathlib import Path
 import numpy as np
 import torch
 from PIL import Image
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, get_peft_model, PeftModel
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
 # ---- Config ----
 MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
+SFT_CHECKPOINT = "checkpoints_sft/final"
 DATASET_DIR = "dataset"
-OUTPUT_DIR = "checkpoints_cot"
+OUTPUT_DIR = "checkpoints_sft_rl"
 LORA_RANK = 64
 LORA_ALPHA = 128
 NUM_GENERATIONS = 4
-MAX_NEW_TOKENS = 128
+MAX_NEW_TOKENS = 32          # Answer-only, same as original GRPO
 LEARNING_RATE = 5e-6
 NUM_EPOCHS = 1
 SAVE_EVERY = 100
@@ -38,25 +37,24 @@ REWARD_CLIP_MIN = -5.0
 
 SYSTEM_PROMPT = (
     "You are measuring a hole in a technical drawing. "
-    "Think step by step about how to determine the diameter using the scale bar. "
-    "End your response with the diameter in mm on its own line, like: ANSWER: <number>"
+    "Use the scale bar to determine the diameter. "
+    "Respond with ONLY the diameter in mm as a number, nothing else."
 )
 USER_PROMPT = "What is the diameter of hole H1 in mm?"
 
 
-def parse_answer(text):
+def parse_number(text):
     text = text.strip()
-    match = re.search(r'ANSWER:\s*(\d+\.?\d*)', text, re.IGNORECASE)
-    if match:
-        return float(match.group(1))
-    numbers = re.findall(r'(\d+\.?\d*)', text)
-    if numbers:
-        return float(numbers[-1])
-    return None
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    match = re.search(r'(\d+\.?\d*)', text)
+    return float(match.group(1)) if match else None
 
 
 def compute_reward(text, gt):
-    pred = parse_answer(text)
+    pred = parse_number(text)
     if pred is None or pred <= 0:
         return REWARD_CLIP_MIN
     return max(-abs(pred - gt) / gt, REWARD_CLIP_MIN)
@@ -69,27 +67,14 @@ def load_dataset(split="train"):
 
 
 def gpu_mem_info():
-    """Return (allocated_gb, reserved_gb, total_gb)."""
     a = torch.cuda.memory_allocated() / 1e9
     r = torch.cuda.memory_reserved() / 1e9
     t = torch.cuda.get_device_properties(0).total_memory / 1e9
     return a, r, t
 
 
-def memory_sanity_check():
-    """Verify GPU has enough free memory before training."""
-    a, r, t = gpu_mem_info()
-    free = t - r
-    print(f"  GPU memory: {a:.1f}GB allocated, {r:.1f}GB reserved, {t:.0f}GB total, {free:.0f}GB free")
-    if free < 20:
-        print(f"  WARNING: Only {free:.0f}GB free. Need ~25GB for CoT training.")
-        print(f"  If this fails, check for stale processes: nvidia-smi")
-        return False
-    return True
-
-
 def grpo_step(model, processor, optimizer, image_path, gt_mm):
-    """One GRPO step with per-completion backward to limit peak memory."""
+    """One GRPO step with per-completion backward."""
     image = Image.open(image_path).convert("RGB")
     messages = [{"role": "user", "content": [
         {"type": "image", "image": image},
@@ -100,7 +85,6 @@ def grpo_step(model, processor, optimizer, image_path, gt_mm):
     inputs = {k: v.to(model.device) for k, v in inputs.items()}
     input_len = inputs["input_ids"].shape[1]
 
-    # Step 1: Generate N completions (no grad)
     completions = []
     gen_ids_list = []
     model.eval()
@@ -116,21 +100,16 @@ def grpo_step(model, processor, optimizer, image_path, gt_mm):
         del outputs
     torch.cuda.empty_cache()
 
-    # Step 2: Rewards and advantages
     rewards = [compute_reward(c, gt_mm) for c in completions]
     mean_r = np.mean(rewards)
     std_r = np.std(rewards) + 1e-8
     advantages = [(r - mean_r) / std_r for r in rewards]
 
-    # Step 3: Per-completion backward (memory-safe)
     model.train()
     optimizer.zero_grad()
     total_loss_val = 0.0
 
     for gen_ids, advantage in zip(gen_ids_list, advantages):
-        if len(gen_ids) > MAX_NEW_TOKENS:
-            gen_ids = gen_ids[:MAX_NEW_TOKENS]
-
         full_ids = torch.cat([inputs["input_ids"][0], gen_ids]).unsqueeze(0)
         out = model(
             input_ids=full_ids,
@@ -159,28 +138,38 @@ def grpo_step(model, processor, optimizer, image_path, gt_mm):
 
 
 def train(resume=False):
-    print("=== CoT GRPO Training (bf16) ===\n")
+    print("=== SFT→RL Pipeline (GRPO from SFT checkpoint) ===\n")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-    # Memory check BEFORE loading model
-    a, r, t = gpu_mem_info()
-    print(f"GPU memory before loading: {a:.1f}GB used / {t:.0f}GB total")
+    if not os.path.exists(SFT_CHECKPOINT):
+        print(f"ERROR: SFT checkpoint not found at {SFT_CHECKPOINT}")
+        print("Run train_sft.py first.")
+        return
+
+    # Memory check
+    a, _, t = gpu_mem_info()
+    print(f"GPU memory: {a:.1f}GB used / {t:.0f}GB total")
     if a > 5:
-        print(f"WARNING: {a:.1f}GB already in use. Stale process?")
-        print("Run: fuser -k /dev/nvidia0  OR restart instance")
+        print("WARNING: Stale GPU memory. Restart instance first.")
         return
 
     samples = load_dataset("train")
     print(f"Train samples: {len(samples)}")
 
-    print(f"Loading {MODEL_ID} in bf16...")
+    # Load base model in bf16
+    print(f"Loading base model {MODEL_ID}...")
     model = AutoModelForImageTextToText.from_pretrained(
         MODEL_ID, torch_dtype=torch.bfloat16, device_map="auto", trust_remote_code=True,
     )
     processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
 
-    model.gradient_checkpointing_enable()
+    # Merge SFT adapter into base weights
+    print(f"Merging SFT adapter from {SFT_CHECKPOINT}...")
+    model = PeftModel.from_pretrained(model, SFT_CHECKPOINT)
+    model = model.merge_and_unload()
+    print("  SFT adapter merged")
 
+    # Apply fresh LoRA for GRPO training
     lora_config = LoraConfig(
         r=LORA_RANK, lora_alpha=LORA_ALPHA,
         target_modules="all-linear", task_type="CAUSAL_LM",
@@ -193,12 +182,11 @@ def train(resume=False):
         lr=LEARNING_RATE,
     )
 
-    # Memory check AFTER loading model
-    if not memory_sanity_check():
-        print("Aborting. Free GPU memory first.")
-        return
+    a, r, t = gpu_mem_info()
+    free = t - r
+    print(f"  GPU: {a:.1f}GB allocated, {free:.0f}GB free")
 
-    # --- Run a single test step before committing ---
+    # 1-step sanity check
     print("\n  Running 1-step sanity check...")
     test_sample = samples[0]
     test_path = str(Path(DATASET_DIR) / "train" / f"image_{test_sample['idx']:04d}.png")
@@ -206,14 +194,12 @@ def train(resume=False):
         loss_val, rewards, completions = grpo_step(
             model, processor, optimizer, test_path, test_sample["diameter_mm"]
         )
-        a, r, t = gpu_mem_info()
-        print(f"  Sanity check PASSED: loss={loss_val:.4f}, mem={a:.0f}/{t:.0f}GB")
-        print(f"  Sample output: '{completions[0][:60]}...'")
+        print(f"  PASSED: loss={loss_val:.4f}, pred='{completions[0]}'")
     except torch.cuda.OutOfMemoryError:
-        print(f"  Sanity check FAILED: OOM. Cannot train CoT on this GPU.")
+        print("  FAILED: OOM")
         return
     except Exception as e:
-        print(f"  Sanity check FAILED: {e}")
+        print(f"  FAILED: {e}")
         return
 
     print("\n  Starting full training...\n")
@@ -233,7 +219,6 @@ def train(resume=False):
     running_reward = []
     running_loss = []
     start_time = time.time()
-    oom_count = 0
 
     for epoch in range(NUM_EPOCHS):
         rng = np.random.default_rng(42 + epoch)
@@ -254,20 +239,14 @@ def train(resume=False):
                 )
                 running_reward.extend(rewards)
                 running_loss.append(loss_val)
-
             except torch.cuda.OutOfMemoryError:
-                oom_count += 1
-                print(f"  Step {global_step}: OOM #{oom_count}, skipping")
+                print(f"  Step {global_step}: OOM, skipping")
                 torch.cuda.empty_cache()
                 gc.collect()
                 optimizer.zero_grad()
-                if oom_count > 10:
-                    print("  Too many OOMs, aborting.")
-                    break
                 continue
             except Exception as e:
                 print(f"  Step {global_step}: ERROR {e}")
-                torch.cuda.empty_cache()
                 continue
 
             if global_step % LOG_EVERY == 0:
@@ -278,7 +257,6 @@ def train(resume=False):
                 actual_steps = global_step - start_step
                 spm = actual_steps / (elapsed / 60) if elapsed > 0 else 0
                 eta = (len(samples) - global_step) / spm if spm > 0 else 0
-                a, _, _ = gpu_mem_info()
 
                 log_entry = {
                     "step": global_step, "epoch": epoch,
@@ -288,16 +266,14 @@ def train(resume=False):
                     "gt_mm": gt_mm,
                     "completions": completions,
                     "rewards": [round(r, 3) for r in rewards],
-                    "gpu_mem_gb": round(a, 1),
                 }
                 with open(log_path, "a") as f:
                     f.write(json.dumps(log_entry) + "\n")
 
-                preview = completions[0][:80].replace('\n', ' ')
                 print(f"  Step {global_step}/{len(samples)} | "
                       f"loss={avg_l:.4f} | reward={avg_r:.3f} | "
                       f"best_r={best_r:.3f} | ETA={eta:.0f}m | "
-                      f"mem={a:.0f}GB | gt={gt_mm:.1f} | '{preview}'")
+                      f"gt={gt_mm:.1f} pred={completions[0]}")
 
             if global_step % SAVE_EVERY == 0:
                 ckpt_path = os.path.join(OUTPUT_DIR, f"checkpoint-{global_step}")
@@ -308,8 +284,7 @@ def train(resume=False):
     final_path = os.path.join(OUTPUT_DIR, "final")
     model.save_pretrained(final_path)
     processor.save_pretrained(final_path)
-    print(f"\n✓ CoT GRPO complete. Saved to {final_path}")
-    print(f"  OOMs: {oom_count}")
+    print(f"\n✓ SFT→RL training complete. Saved to {final_path}")
 
 
 if __name__ == "__main__":
