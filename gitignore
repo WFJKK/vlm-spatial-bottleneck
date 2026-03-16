@@ -1,5 +1,6 @@
 dataset/
-checkpoints/
+checkpoints*/
+!checkpoints*/training_log.jsonl
 __pycache__/
 *.pyc
 *.egg-info/
