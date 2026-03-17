@@ -138,7 +138,7 @@ def extract_vision_embeddings(model, processor, image_path):
     else:
         pooled = features.flatten()
 
-    return pooled.numpy().astype(np.float32)
+    return pooled.float().numpy()
 
 
 def extract_all_embeddings():
