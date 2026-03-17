@@ -1,140 +1,260 @@
-# Can RL Teach Vision-Language Models to See Spatially?
+# Synthetic Dataset Generation for VLM Engineering Documentation QA
 
-**TL;DR:** We train a VLM (Qwen2.5-VL-7B) to estimate physical distances from images using reinforcement learning. GRPO discovers scale bar usage that nobody explicitly taught. SFT→RL combines the best of both: SFT's output precision + RL's spatial reasoning. Chain-of-thought reasoning is unfaithful — the model writes correct-sounding spatial descriptions that don't match its actual visual processing. Matched pair diagnostics causally verify what the model learned.
+**Author:** Joshua Kames-King
 
-## Key Results
+**Built with:** Claude Code (Anthropic) was used extensively as a development tool throughout this project. The dataset is designed for fine-tuning Mistral's vision-language models.
 
-| Method | MAE (mm) | Scale Bar Usage | What It Learned |
-|---|---|---|---|
-| Baseline (no training) | 7.72 | ✗ Ignores | Random guessing |
-| CoT GRPO | 5.42 | ✗ Ignores | Unfaithful reasoning (see below) |
-| SFT | 3.08 | ✓ Partial (r=0.58) | Precise decimals + some scale bar use |
-| GRPO answer-only | 3.61 | ✓ Strong (r=0.75) | Consistent scale bar use, but rounds to 5mm |
-| **SFT → RL** | **2.29** | **✓ Strong (r=0.65)** | **Precise output + spatial reasoning** |
+---
 
-**Pixel regression floor: 5.86mm** — anything below this requires using the scale bar.
-**Perfect (scale bar formula): 0.007mm** — the theoretical ceiling.
+A synthetic data generation pipeline that produces multimodal training data for vision-language models on engineering design compliance checking. The pipeline generates technical drawings of mechanical plates with holes, paired with specification documents and exhaustive question-answer sets with step-by-step reasoning chains.
 
-## Four Findings
+This dataset aims to specifically train VLMs to 1) strengthen quantitative visual "understanding" and 2) perform multi-modal multi-hop reasoning as described in more detail in the next subsection.
 
-### 1. RL discovers spatial reasoning that nobody programmed.
-GRPO, with nothing but a "your number was wrong" reward signal, taught the model to relate hole size to scale bar size. The matched pair diagnostic proves this causally: same hole pixels + different scale bar → model gives different answers (r=0.75). No explicit supervision on *how* to use the scale bar.
+## Motivation and General Idea
 
-### 2. SFT and RL learn different things.
-SFT produces precise decimals (17.64mm) but ignores the scale bar 21% of the time. GRPO always uses the scale bar but outputs round numbers (20mm). They solve different subproblems: SFT learns output calibration, RL learns spatial consistency. This decomposition is invisible to MAE — only the matched pair diagnostic reveals it.
+Current VLMs struggle with cross-modal reasoning on engineering documents — extracting rules from text specifications and applying them to visual diagrams. DesignQA showed that even GPT-4o and LLaVA perform poorly on compliance checking tasks.
 
-### 3. Chain-of-thought reasoning is unfaithful for spatial perception.
-CoT GRPO (5.42mm) performed worse than answer-only GRPO (3.61mm) despite more compute. Analysis of the reasoning traces reveals why:
+It is a priori not obvious what the exact failure mode is: a lack of ability of VLMs to infer quantitative data from the images, or multi-modal reasoning itself, or even a combination of both. There are hints in the literature that VLMs struggle significantly with quantitative visual questions ("how far apart are these objects?"), see for example Liao et al. (Q-Spatial, arXiv:2409.09788). Hence, we consider a self-created synthetic dataset that targets both failure modes through two controllable meta-parameters:
 
-**When the model gets it right** (gt=11.73mm, answer=12mm):
-> "The circle appears to be slightly less than half the length of the 25mm bar."
+1. **Annotation density**: Each drawing is generated at three levels: fully annotated (all dimensions labeled), partially annotated (some dimensions removed), and unannotated (no dimension labels). At full annotation the task reduces to OCR + logic, isolating the reasoning component. At no annotation the model must infer measurements from visual proportions alone, directly training the quantitative spatial skill that the literature identifies as deficient. SpatialVLM (Chen et al., CVPR 2024) showed that this gap is data-driven rather than architectural — training on synthetic spatial data significantly improved quantitative estimation. Hence we are hopeful that synthetic data will help here too.
 
-**When the model gets it wrong** (gt=5.03mm, answer=15mm):
-> "The hole appears to be approximately half the length of the scale bar."
+2. **Rule complexity**: Specification documents range from simple single-threshold rules ("all holes shall have diameter 8.0 ± 0.3mm") to conditional rules that require multi-hop cross-modal reasoning ("for Class A joints where hole spacing < 20mm, minimum edge distance shall be ≥ 2.0× hole diameter"). This forces the model to perform image → text → image → compute chains of increasing depth, targeting the cross-modal reasoning gap identified by DesignQA.
 
-The model reads the scale bar label correctly **100% of the time** and always attempts proportional reasoning. But the proportion estimates are unreliable — "half" is a learned template, not a faithful description of what the model perceives. When the hole happens to be ~half the scale bar, the template works. When it's actually 1/6 the scale bar, the model still writes "half" and gets it catastrophically wrong.
+By varying these two axes independently, the dataset serves both as training data (graduated difficulty acts as a curriculum) and as a diagnostic tool (performance across the grid reveals whether failures stem from spatial inference, reasoning, or their combination).
 
-**The reasoning strategy evolves over training** but never becomes faithful:
+In addition, we include step-by-step reasoning chains as worked examples in the training data (but not as part of the evaluation).
 
-| Training Phase | Dominant Strategy |
-|---|---|
-| Steps 1–50 | "Measure the diameter" (92%), "multiply" (58%) |
-| Steps 50–200 | "Compare size" emerges (36%), less multiplication |
-| Steps 200–400 | "Compare size" grows (44%), "measure" declines (23%) |
-| Steps 400+ | "Compare size" dominates (78%), "estimate" emerges (63%) |
-
-The model discovers that comparing sizes is the right approach, but it cannot verbalize the comparison faithfully. This is the same pattern found in our earlier SFT compliance experiment: models say "using the scale bar" even on blank images. **Unfaithful spatial reasoning persists regardless of training method (SFT or RL).**
-
-This aligns with MeasureBench's finding that chain-of-thought doesn't improve spatial perception, and extends it: CoT fails not because the model doesn't try to reason spatially, but because verbal descriptions of spatial proportions are unreliable.
-
-### 4. SFT→RL is complementary, not redundant.
-The standard pipeline (SFT first, then RL) achieves the best result (2.29mm) because SFT teaches precise decimal output and RL refines spatial reasoning. Neither alone achieves both. GRPO's mode collapse toward round numbers (83% multiples of 5) is mitigated by SFT's prior for precise values.
-
-## Methodology: Shortcut-Proof Evaluation
-
-Most spatial benchmarks have exploitable shortcuts. We designed against them:
-
-**Anti-shortcut dataset.** Continuous uniform diameters (3–30mm), variable zoom independent of diameter, 8 different scale bar values, no text leaks. Every possible shortcut is verified:
-
-```
-Correlation with ground truth diameter:
-  hole_pixels alone                    r = +0.44  (not enough)
-  scale_bar_mm alone                   r = -0.00  (useless)
-  CORRECT: hole_px × sb_mm / sb_px    r = +1.00  (only path)
-```
-
-**Matched pair diagnostic.** 40 image pairs where the hole is pixel-identical but the scale bar differs. If the model gives the same answer for both → not using the scale bar. If answers diverge correctly → causally proven scale bar usage. This is a general-purpose method for testing whether a VLM uses any specific visual feature.
+Each example requires the model to:
+1. **Parse rules** from a specification document (text)
+2. **Extract measurements** from a technical drawing (image)
+3. **Apply rules to measurements** and determine compliance (reasoning)
 
 ## Architecture
 
+The pipeline has five stages:
+
 ```
-Task:    Image of hole + scale bar  →  diameter in mm
-Model:   Qwen2.5-VL-7B-Instruct + LoRA (rank 64)
-Reward:  -|predicted - ground_truth| / ground_truth  (continuous)
-Method:  Custom GRPO loop (4 generations, per-completion backward)
-Compute: A100 80GB, ~$5 per experiment
+sampler.py → spec_generator.py → question_generator.py → renderer.py → orchestrator.py
 ```
 
-The correct strategy the model must discover:
-```
-diameter_mm = hole_pixels × (scale_bar_mm / scale_bar_pixels)
-```
+### 1. Parameter Sampler (`sampler.py`)
 
-No part of this formula is provided during training. The model receives only images and scalar reward.
+Generates plate configurations with controlled compliance states using **constructive sampling**:
+- Decides the desired outcome first (which rules should be violated, by which holes)
+- Places holes to achieve that exact compliance state
+- Verifies geometric validity and single-rule violations
 
-## Connection to Prior Work
+This avoids the reject-and-retry problem of random generation. Each violating hole fails exactly one intended rule, giving clean ground truth.
 
-**MeasureBench (Oct 2025)** applied GRPO to Qwen2.5-VL-7B for gauge reading. They found RL helps on synthetic but not real images, concluded that better visual encoding may be needed, and did not compare RL to SFT. We extend their work with shortcut-proof evaluation, an SFT comparison, and evidence that RL and SFT learn complementary skills.
+**Parameters:**
+- Plate dimensions: 80–160mm × 50–100mm
+- Holes: 3–8 per plate, diameters 6–16mm
+- Four rule types: tolerance, edge distance, spacing, bolt population
 
-**SpatialVLM (CVPR 2024)** argued VLMs' spatial limitations come from datasets, not architecture. Our results partially support this: SFT→RL cuts MAE from 7.72mm to 2.29mm without architectural changes. But the CoT failure suggests a limit — the model can improve through training but cannot faithfully verbalize its spatial processing.
+### 2. Specification Generator (`spec_generator.py`)
 
-**VLAA-Thinker (2025)** found SFT before GRPO degrades reasoning performance on general VLM tasks. Our spatial task shows the opposite — SFT→RL outperforms either alone — suggesting the interaction between SFT and RL depends on the task structure.
+Converts plate configurations into readable specification documents. The same underlying rules are presented with varying complexity:
 
-**DeepSeek-R1** showed RL produces emergent text reasoning (chain-of-thought, self-verification) without supervision. We tested the same hypothesis for spatial perception and found it partially holds: RL produces emergent scale bar usage (answer-only GRPO) but NOT emergent faithful spatial reasoning (CoT GRPO). The visual domain is harder than the text domain for emergent reasoning.
+- **Simple**: 2–3 rules, direct statements ("All holes shall have diameter 10.0 ± 0.5mm")
+- **Multi-rule**: 4 rules including bolt population, single zone
+- **Conditional**: 4 rules, two zones, table lookups, material-class mapping requiring multi-hop reasoning
 
-## Reproducing
+Rule order is shuffled in the document while preserving IDs, forcing models to locate rules by ID rather than position.
+
+For conditional complexity, the model must chain multiple lookups:
+1. Read material from header → "Aluminum 6061-T6"
+2. Look up material-to-class mapping → Class II
+3. Find tolerance table, Class II row
+4. Determine hole size category (small/large)
+5. Extract tolerance and compute acceptable range
+
+### 3. Question Generator (`question_generator.py`)
+
+Produces exhaustive question-answer pairs with **annotation-aware reasoning chains**:
+
+- **Per-component compliance**: Every hole × every rule checked individually
+- **Full audit**: "List all violations" — tests systematic completeness
+- **Measurement extraction**: Distance between holes or edge distances
+- **Rule selection** (conditional only): Tests spec parsing ("What tolerance applies to Zone B?")
+- **Counterfactual**: "What minimum edge distance would H3 need to comply?" — tests backward reasoning
+
+The reasoning chains adapt to the annotation level:
+- **Full**: Exact values from labels — "H1 diameter is 7.9mm."
+- **Partial**: Mix of exact (for visible labels) and approximate — "From the scale bar, H2 diameter appears approximately 8mm."
+- **Minimal**: All approximate — "From the scale bar, H3 appears approximately 10mm from the top edge."
+
+This ensures the training data teaches reasoning that matches what the model can actually see in each image. The annotation visibility decisions are shared between the renderer and question generator so they always agree on what's shown.
+
+### 4. Image Renderer (`renderer.py`)
+
+Generates technical drawings with three annotation levels:
+
+- **Full**: All diameters labeled, edge distances shown, spacing annotations
+- **Partial**: Some annotations randomly hidden (ensuring hidden ones are relevant to violations)
+- **Minimal**: Hole IDs only, scale bar, no dimension labels
+
+The annotation level controls how hard it is to extract measurements from the image. The same questions apply regardless of annotation level — only the visual information changes.
+
+### 5. Pipeline Orchestrator (`orchestrator.py`)
+
+Generates balanced datasets with even distribution across:
+- 3 rule complexities × 3 annotation levels × 4 violation counts = 36 combinations
+
+Outputs:
+- `dataset.jsonl` — one record per example with image path, spec text, all QA pairs, and full metadata
+- `images/` — PNG technical drawings
+- `stats.json` — dataset statistics
+
+## Design Decisions
+
+### Why constructive sampling?
+
+Random hole placement with post-hoc compliance checking leads to either: (a) most examples being fully compliant (which is not useful), or (b) messy multi-rule violations that make ground truth ambiguous. Constructive sampling guarantees exact control over the compliance state.
+
+### Why three annotation levels?
+
+This creates a natural curriculum:
+- **Full annotation** teaches the reasoning pattern: parse rule → extract value → compute → conclude
+- **Minimal annotation** forces visual inference: the model already knows the reasoning, but must get numbers from geometry instead of labels, which might be one of the failure modes as described in the motivation section
+- The same questions and answers apply regardless — only the information source changes
+
+### Why exhaustive hole × rule questions?
+
+Each example checks every hole against every rule. This teaches systematic compliance checking rather than cherry-picking. A model trained on incomplete checks would learn to be incomplete.
+
+### Avoiding data contamination
+
+The data teaches reasoning skills, not memorizable facts, by construction:
+- Every example has unique plate dimensions, hole positions, and rule parameters
+- Rule order is shuffled in specs
+- Material-class mapping is consistent but tolerance values vary per example
+- The model cannot memorize "Aluminum = ±0.5mm" because the tolerance for each class changes between examples
+
+## Evaluation
+
+The evaluation script (`evaluate.py`) scores model predictions against ground truth on five metrics. There are two directions of failure: reasoning and quantitative spatial inference ability, and models may have different behaviours with regard to these two dimensions.
+
+### 1. Compliance Classification Accuracy
+Binary Yes/No for each hole × rule pair. Broken down by:
+- **Annotation level**: Does accuracy drop from full → partial → minimal? This gap measures quantitative spatial inference ability.
+- **Rule complexity**: simple → multi_rule → conditional. Here we are probing multi-modal reasoning.
+- **Rule type**: tolerance vs edge distance vs spacing vs bolt
+- **Answer balance**: accuracy on Yes vs No answers (detects bias)
+
+### 2. Full Audit F1
+The model produces a violation list, ground truth is a list. Precision catches hallucinated violations, recall catches missed ones. F1 combines both.
+
+### 3. Measurement Extraction Error
+Absolute error in mm between predicted and true distances. Directly measures spatial information extraction from images.
+
+### 4. Rule Understanding Accuracy
+For rule_selection questions — can the model correctly parse the spec to find applicable parameters?
+
+### 5. Counterfactual Accuracy
+Can the model compute correct thresholds for compliance? Tests backward reasoning.
+
+### Running Evaluation
 
 ```bash
-# Full experiment: ~$5 on A100 80GB
-git clone https://github.com/WFJKK/Multimodal-GRPO.git
-cd Multimodal-GRPO
-bash setup.sh                    # Generate shortcut-proof dataset
-python3 train_sft.py             # SFT baseline (~30 min)
-python3 train_grpo_custom.py     # GRPO answer-only (~3 hrs)
-python3 train_grpo_from_sft.py   # SFT→RL pipeline (~2.5 hrs)
-python3 train_grpo_cot.py        # CoT GRPO (~6 hrs for full run)
-python3 evaluate.py --compare    # Full comparison table
+# Generate predictions (one JSONL line per question)
+# Format: {"example_id": "EX-0000", "question_index": 0, "prediction": "Yes"}
+
+# Score predictions
+python evaluate.py --predictions predictions.jsonl --ground_truth dataset/dataset.jsonl
+
+# Test with mock models
+python test_evaluate.py
 ```
 
-All results are deterministic (seed 42) and the dataset generator verifies no shortcuts exist before producing images.
+## Usage
 
-## Limitations
+### Setup
 
-- **No KL penalty** in GRPO — leads to mode collapse (round numbers in standalone GRPO, repeated values in SFT→RL). Standard fix, not implemented.
-- **Synthetic only** — no real-world transfer test. The matched pair methodology transfers but the trained models may not.
-- **Single task** — hole diameter measurement. The methodology generalizes but is demonstrated on one task.
-- **Compute not matched** — GRPO uses ~10x more compute than SFT per step. Multi-epoch SFT might close the gap.
-- **CoT ran at 500/1000 steps** — partial training, though reasoning analysis suggests the strategy was stable by step 300.
-
-## Repository Structure
-
-```
-generate_dataset.py        # Shortcut-proof dataset generator with verification
-train_sft.py               # Supervised fine-tuning baseline
-train_grpo_custom.py       # Custom GRPO loop (answer-only)
-train_grpo_cot.py          # GRPO with chain-of-thought
-train_grpo_from_sft.py     # SFT→RL pipeline
-evaluate.py                # Evaluation + matched pair diagnostic
-results/                   # All experimental results (JSON)
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv sync
 ```
 
-## Citation
+### Sample Dataset
+
+A pre-generated sample of 200 examples (~3,500 questions) is included in `dataset/`. This contains:
+
+- `dataset.jsonl` — one JSON record per example, each with the image path, full specification text, all question-answer pairs with reasoning chains, and metadata (rule complexity, annotation level, violation count, hole positions, rule parameters)
+- `images/` — 200 PNG technical drawings at varying annotation levels (full, partial, minimal)
+- `stats.json` — summary statistics showing the distribution across complexities, annotation levels, violation counts, and question types
+
+This sample is ready to use for fine-tuning or evaluation without running the pipeline. To regenerate or produce a larger dataset:
+
+### Generate Dataset
+
+```bash
+# Default: 200 examples in ./dataset/
+uv run python orchestrator.py
+
+# Custom
+uv run python orchestrator.py --num 500 --output ./my_dataset --seed 0
+```
+
+### Output Structure
 
 ```
-@misc{kames2026spatial,
-  title={Can RL Teach Vision-Language Models to See Spatially?},
-  author={Kames, Joshua},
-  year={2026},
-  url={https://github.com/WFJKK/Multimodal-GRPO}
+dataset/
+  dataset.jsonl      # All examples with QA pairs and metadata
+  stats.json         # Dataset statistics
+  images/
+    EX-0000.png
+    EX-0001.png
+    ...
+```
+
+### JSONL Record Format
+
+```json
+{
+  "example_id": "EX-0000",
+  "image": "images/EX-0000.png",
+  "spec_text": "SPEC-GP-672: Guide Plate GP-672 Design Requirements\n\nRule R1: ...",
+  "questions": [
+    {
+      "type": "per_component_compliance",
+      "question": "Does hole H1 comply with Rule R1?",
+      "answer": "Yes",
+      "reasoning": "H1 diameter is 8.1mm. Rule R1 specifies nominal 8.0 ± 0.3mm..."
+    }
+  ],
+  "metadata": {
+    "seed": 0,
+    "rule_complexity": "simple",
+    "annotation_level": "full",
+    "num_violations": 1,
+    "plate_width": 131.0,
+    "plate_height": 63.0,
+    "holes": [...],
+    "rules": [...]
+  }
 }
+```
+
+## Known Limitations & Future Work
+
+- **Spacing violations are underrepresented** (~5% of violations) due to geometric constraints in constructive placement. Improved from <1% by biasing placement toward plate interior, but still lower than other rule types.
+- **Visual fidelity is synthetic** — matplotlib drawings, not real CAD output. Transfer to real engineering documents is an open question.
+- **Linguistic diversity is limited** — template-based specs use the same sentence patterns. An LLM paraphrase step could add variety.
+
+## Development
+
+### Package Management
+
+Uses `uv` with `pyproject.toml` for dependency management.
+
+### Code Quality
+
+- **Language:** Python 3.12
+- **Type hints:** All functions have comprehensive type annotations
+- **Type checking:** Passes `pyright` in basic mode with 0 errors, 0 warnings
+- **Dependencies:** numpy, matplotlib
+
+```bash
+# Verify type checking
+uv run pyright sampler.py spec_generator.py question_generator.py renderer.py orchestrator.py evaluate.py
 ```
