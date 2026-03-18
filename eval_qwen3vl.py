@@ -51,44 +51,94 @@ def parse_number(text):
 
 
 def load_model():
-    """Load Qwen3-VL-8B for inference."""
-    from transformers import AutoModelForImageTextToText, AutoProcessor
+    """Load Qwen3-VL-8B using the exact API from HuggingFace docs."""
+    from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 
     print(f"Loading {MODEL_ID}...")
-    model = AutoModelForImageTextToText.from_pretrained(
-        MODEL_ID, dtype=torch.bfloat16, device_map={"": 0}, trust_remote_code=True,
+    model = Qwen3VLForConditionalGeneration.from_pretrained(
+        MODEL_ID,
+        dtype=torch.bfloat16,
+        device_map={"": 0},  # Force single GPU - prevents multi-GPU peer memory errors
     )
-    processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
+    processor = AutoProcessor.from_pretrained(MODEL_ID)
     model.eval()
     return model, processor
 
 
 def run_inference(model, processor, image_path):
-    """Run inference on a single image, return predicted text."""
-    image = Image.open(image_path).convert("RGB")
-    messages = [{"role": "user", "content": [
-        {"type": "image", "image": image},
-        {"type": "text", "text": f"{SYSTEM_PROMPT}\n\n{USER_PROMPT}"},
-    ]}]
+    """Run inference on a single image using Qwen3-VL API.
 
+    Qwen3-VL uses a different API than Qwen2.5-VL:
+    - Images passed as file paths in messages (not PIL objects to processor)
+    - apply_chat_template returns tokenized inputs directly
+    """
+    # Qwen3-VL expects file:// paths or URLs in messages
+    abs_path = os.path.abspath(image_path)
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": [
+            {"type": "image", "image": f"file://{abs_path}"},
+            {"type": "text", "text": USER_PROMPT},
+        ]},
+    ]
+
+    # Qwen3-VL: apply_chat_template handles both tokenization and image processing
     inputs = processor.apply_chat_template(
-        messages, tokenize=True, add_generation_prompt=True,
-        return_dict=True, return_tensors="pt",
-    ).to(model.device)
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+        return_tensors="pt",
+    )
+    inputs = inputs.to(model.device)
 
     with torch.no_grad():
-        outputs = model.generate(**inputs, max_new_tokens=32, do_sample=False)
+        generated_ids = model.generate(**inputs, max_new_tokens=32, do_sample=False)
 
-    # Trim input tokens
-    generated = outputs[0, inputs["input_ids"].shape[1]:]
-    text = processor.decode(generated, skip_special_tokens=True).strip()
+    # Trim input tokens to get only generated text
+    generated_ids_trimmed = [
+        out_ids[len(in_ids):]
+        for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+    ]
+    text = processor.batch_decode(
+        generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+    )[0].strip()
+
     return text
+
+
+def smoke_test(model, processor):
+    """Run one image to verify everything works before full eval."""
+    meta_path = Path(DATASET_DIR) / "test" / "metadata.jsonl"
+    with open(meta_path) as f:
+        sample = json.loads(f.readline())
+
+    image_path = str(Path(DATASET_DIR) / "test" / f"image_{sample['idx']:04d}.png")
+    print(f"  Smoke test: image {sample['idx']}, gt={sample['diameter_mm']:.1f}mm")
+
+    try:
+        text = run_inference(model, processor, image_path)
+        pred = parse_number(text)
+        print(f"  Output: '{text}' -> {pred}mm")
+        print(f"  Smoke test PASSED")
+        return True
+    except Exception as e:
+        print(f"  Smoke test FAILED: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
 
 
 def run_eval():
     """Run baseline evaluation on test set + matched pairs."""
     model, processor = load_model()
     os.makedirs(RESULTS_DIR, exist_ok=True)
+
+    # Smoke test first
+    print("\n--- Smoke Test ---")
+    if not smoke_test(model, processor):
+        print("ABORTING: smoke test failed")
+        return None
 
     # Load test metadata
     meta_path = Path(DATASET_DIR) / "test" / "metadata.jsonl"
@@ -102,9 +152,13 @@ def run_eval():
     maes = []
     for i, sample in enumerate(samples):
         image_path = str(Path(DATASET_DIR) / "test" / f"image_{sample['idx']:04d}.png")
-        text = run_inference(model, processor, image_path)
-        pred = parse_number(text)
+        try:
+            text = run_inference(model, processor, image_path)
+        except Exception as e:
+            print(f"    Image {sample['idx']}: ERROR {e}")
+            text = ""
 
+        pred = parse_number(text)
         gt = sample["diameter_mm"]
         ae = abs(pred - gt) if pred else None
 
@@ -156,12 +210,17 @@ def run_eval():
         print(f"\n=== Matched Pair Diagnostic ({len(pairs_meta)} pairs) ===")
 
         pair_results = []
-        for pm in pairs_meta:
+        for j, pm in enumerate(pairs_meta):
             img_a = str(matched_dir / f"pair_{pm['pair_idx']:03d}_a.png")
             img_b = str(matched_dir / f"pair_{pm['pair_idx']:03d}_b.png")
 
-            text_a = run_inference(model, processor, img_a)
-            text_b = run_inference(model, processor, img_b)
+            try:
+                text_a = run_inference(model, processor, img_a)
+                text_b = run_inference(model, processor, img_b)
+            except Exception as e:
+                print(f"    Pair {pm['pair_idx']}: ERROR {e}")
+                continue
+
             pred_a = parse_number(text_a)
             pred_b = parse_number(text_b)
 
@@ -173,6 +232,9 @@ def run_eval():
                 "pred_b": pred_b,
                 "same_answer": pred_a == pred_b if (pred_a and pred_b) else None,
             })
+
+            if (j + 1) % 10 == 0:
+                print(f"    [{j+1}/{len(pairs_meta)}] pairs done")
 
         # Analysis
         valid_pairs = [p for p in pair_results if p["pred_a"] and p["pred_b"]]
@@ -201,7 +263,7 @@ def run_eval():
                 "interpretation": interpretation,
             }
 
-            print(f"  Correlation: {corr:.4f}")
+            print(f"\n  Correlation: {corr:.4f}")
             print(f"  Same answer: {frac_same:.1%}")
             print(f"  Interpretation: {interpretation}")
 
@@ -220,58 +282,163 @@ def run_eval():
     return metrics
 
 
+def find_vision_module(model):
+    """Auto-discover the vision encoder output module for probing.
+
+    Qwen3-VL has DeepStack which changes the architecture.
+    We search for known module names and print what we find.
+    """
+    candidates = [
+        "visual.merger",
+        "model.visual.merger",
+        "visual",
+        "model.visual",
+    ]
+
+    # Try known paths
+    for path in candidates:
+        module = model
+        try:
+            for attr in path.split("."):
+                module = getattr(module, attr)
+            print(f"  Found module at: {path}")
+            return module, path
+        except AttributeError:
+            continue
+
+    # Search for merger or deepstack
+    print("  Searching all modules for merger/deepstack...")
+    found = []
+    for name, module in model.named_modules():
+        name_lower = name.lower()
+        if any(kw in name_lower for kw in ["merger", "deepstack", "visual"]):
+            n_params = sum(p.numel() for p in module.parameters())
+            if n_params > 0:
+                found.append((name, n_params))
+
+    if found:
+        # Sort by depth (fewer dots = higher level)
+        found.sort(key=lambda x: x[0].count("."))
+        for name, n_params in found[:10]:
+            print(f"    {name}: {n_params:,} params")
+
+        # Use the first high-level visual module
+        best_name = found[0][0]
+        module = model
+        for attr in best_name.split("."):
+            module = getattr(module, attr)
+        print(f"  Using: {best_name}")
+        return module, best_name
+
+    # Last resort: print top-level structure
+    print("  ERROR: No vision module found. Model structure:")
+    for name, _ in model.named_children():
+        print(f"    {name}")
+    return None, None
+
+
 def run_probe():
     """Extract vision encoder embeddings and train linear probe."""
     from sklearn.linear_model import Ridge
     from sklearn.model_selection import cross_val_score
-    from transformers import AutoModelForImageTextToText, AutoProcessor
+    from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 
     os.makedirs(EMBEDDINGS_DIR, exist_ok=True)
     out_path = os.path.join(EMBEDDINGS_DIR, "qwen3vl_baseline.npy")
 
     if os.path.exists(out_path):
-        print(f"Embeddings already exist at {out_path}, skipping extraction")
+        print(f"Embeddings already exist at {out_path}, loading...")
         X = np.load(out_path)
     else:
         print(f"Loading {MODEL_ID} for probing...")
-        model = AutoModelForImageTextToText.from_pretrained(
-            MODEL_ID, dtype=torch.bfloat16, device_map={"": 0}, trust_remote_code=True,
+        model = Qwen3VLForConditionalGeneration.from_pretrained(
+            MODEL_ID, dtype=torch.bfloat16, device_map={"": 0},
         )
-        processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
+        processor = AutoProcessor.from_pretrained(MODEL_ID)
         model.eval()
 
-        # Find the merger module
-        merger_module = None
-        for name, module in model.named_modules():
-            if "merger" in name.lower():
-                merger_module = module
-                print(f"  Found merger at: {name}")
-                break
-
-        if merger_module is None:
-            print("  WARNING: No merger found. Searching for visual encoder output...")
-            for name, module in model.named_modules():
-                if "visual" in name.lower():
-                    print(f"    Found: {name}")
+        # Find vision module to hook
+        vision_module, module_path = find_vision_module(model)
+        if vision_module is None:
+            print("Cannot probe: no vision module found")
+            return
 
         meta_path = Path(DATASET_DIR) / "test" / "metadata.jsonl"
         with open(meta_path) as f:
             samples = [json.loads(l) for l in f]
 
+        # Test hook on first image
+        print("\n  Testing hook on first image...")
+        first_sample = samples[0]
+        first_path = str(Path(DATASET_DIR) / "test" / f"image_{first_sample['idx']:04d}.png")
+        abs_path = os.path.abspath(first_path)
+
+        test_output = {}
+
+        def test_hook_fn(module, input, output):
+            if isinstance(output, tuple):
+                test_output["features"] = output[0].detach().cpu().float()
+            elif isinstance(output, torch.Tensor):
+                test_output["features"] = output.detach().cpu().float()
+
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": [
+                {"type": "image", "image": f"file://{abs_path}"},
+                {"type": "text", "text": USER_PROMPT},
+            ]},
+        ]
+        inputs = processor.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True,
+            return_dict=True, return_tensors="pt",
+        ).to(model.device)
+
+        handle = vision_module.register_forward_hook(test_hook_fn)
+        with torch.no_grad():
+            model.generate(**inputs, max_new_tokens=1)
+        handle.remove()
+
+        if "features" not in test_output:
+            print("  Hook did not capture features. Trying parent module...")
+            # Try hooking the parent of the found module
+            parent_path = ".".join(module_path.split(".")[:-1])
+            if parent_path:
+                parent = model
+                for attr in parent_path.split("."):
+                    parent = getattr(parent, attr)
+                handle = parent.register_forward_hook(test_hook_fn)
+                with torch.no_grad():
+                    model.generate(**inputs, max_new_tokens=1)
+                handle.remove()
+                vision_module = parent
+                module_path = parent_path
+
+            if "features" not in test_output:
+                print("  FAILED: Cannot capture vision features. Aborting probe.")
+                del model
+                torch.cuda.empty_cache()
+                return
+
+        feat = test_output["features"]
+        if feat.dim() == 3:
+            emb_dim = feat.shape[-1]
+            n_patches = feat.shape[1]
+        elif feat.dim() == 2:
+            emb_dim = feat.shape[-1]
+            n_patches = feat.shape[0]
+        else:
+            emb_dim = feat.numel()
+            n_patches = 1
+        print(f"  Hook works! Feature shape: {list(feat.shape)}, "
+              f"patches: {n_patches}, dim: {emb_dim}")
+
+        # Extract all embeddings
+        print(f"\n  Extracting embeddings for {len(samples)} images...")
         embeddings = []
+
         for i, sample in enumerate(samples):
             image_path = str(Path(DATASET_DIR) / "test" / f"image_{sample['idx']:04d}.png")
-            image = Image.open(image_path).convert("RGB")
-
-            messages = [{"role": "user", "content": [
-                {"type": "image", "image": image},
-                {"type": "text", "text": f"{SYSTEM_PROMPT}\n\n{USER_PROMPT}"},
-            ]}]
-
-            inputs = processor.apply_chat_template(
-                messages, tokenize=True, add_generation_prompt=True,
-                return_dict=True, return_tensors="pt",
-            ).to(model.device)
+            abs_path = os.path.abspath(image_path)
 
             vision_output = {}
 
@@ -281,42 +448,70 @@ def run_probe():
                 elif isinstance(output, torch.Tensor):
                     vision_output["features"] = output.detach().cpu().float()
 
-            hook_handle = merger_module.register_forward_hook(hook_fn)
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": [
+                    {"type": "image", "image": f"file://{abs_path}"},
+                    {"type": "text", "text": USER_PROMPT},
+                ]},
+            ]
 
-            with torch.no_grad():
-                try:
+            try:
+                inputs = processor.apply_chat_template(
+                    messages, tokenize=True, add_generation_prompt=True,
+                    return_dict=True, return_tensors="pt",
+                ).to(model.device)
+
+                handle = vision_module.register_forward_hook(hook_fn)
+                with torch.no_grad():
                     model.generate(**inputs, max_new_tokens=1)
-                except Exception:
-                    pass
+                handle.remove()
 
-            hook_handle.remove()
-
-            if "features" in vision_output:
-                features = vision_output["features"]
-                if features.dim() == 3:
-                    pooled = features[0].mean(dim=0)
-                elif features.dim() == 2:
-                    pooled = features.mean(dim=0)
+                if "features" in vision_output:
+                    features = vision_output["features"]
+                    if features.dim() == 3:
+                        pooled = features[0].mean(dim=0)
+                    elif features.dim() == 2:
+                        pooled = features.mean(dim=0)
+                    else:
+                        pooled = features.flatten()
+                    embeddings.append(pooled.numpy())
                 else:
-                    pooled = features.flatten()
-                embeddings.append(pooled.numpy())
-            else:
-                print(f"    Image {sample['idx']}: no features captured")
+                    print(f"    Image {sample['idx']}: no features captured")
+                    if embeddings:
+                        embeddings.append(np.zeros_like(embeddings[-1]))
+            except Exception as e:
+                print(f"    Image {sample['idx']}: ERROR {e}")
                 if embeddings:
                     embeddings.append(np.zeros_like(embeddings[-1]))
 
             if (i + 1) % 50 == 0:
                 print(f"    {i+1}/{len(samples)}")
 
-        X = np.stack(embeddings)
-        np.save(out_path, X)
-        print(f"  Saved embeddings: {X.shape}")
+        if len(embeddings) == len(samples):
+            X = np.stack(embeddings)
+            np.save(out_path, X)
+            print(f"  Saved embeddings: {X.shape}")
+        else:
+            print(f"  Incomplete: {len(embeddings)}/{len(samples)}")
+            del model
+            torch.cuda.empty_cache()
+            return
 
         del model
         torch.cuda.empty_cache()
 
     # Load ground truth
-    gt_data = np.load(os.path.join(EMBEDDINGS_DIR, "ground_truth.npy"), allow_pickle=True).item()
+    gt_path = os.path.join(EMBEDDINGS_DIR, "ground_truth.npy")
+    if not os.path.exists(gt_path):
+        meta_path = Path(DATASET_DIR) / "test" / "metadata.jsonl"
+        with open(meta_path) as f:
+            samples = [json.loads(l) for l in f]
+        gt_data = {s["idx"]: s["diameter_mm"] for s in samples}
+        np.save(gt_path, gt_data)
+    else:
+        gt_data = np.load(gt_path, allow_pickle=True).item()
+
     gt = np.array([gt_data[i] for i in sorted(gt_data.keys())])
 
     # Linear probe
@@ -340,7 +535,7 @@ def run_probe():
     print(f"    Qwen3-VL probe:    {mae:.2f}mm  R²={r2:.3f}")
     print()
 
-    # Load Qwen3-VL eval results if available
+    # Load eval results if available
     metrics_path = os.path.join(RESULTS_DIR, "metrics.json")
     if os.path.exists(metrics_path):
         with open(metrics_path) as f:
@@ -348,20 +543,20 @@ def run_probe():
         output_mae = metrics.get("mae_mm")
         if output_mae:
             gap = output_mae - mae
-            print(f"  Bottleneck 1 analysis:")
-            print(f"    Vision encoder probe: {mae:.2f}mm")
-            print(f"    Model output:         {output_mae:.2f}mm")
-            print(f"    Gap:                  {gap:.2f}mm")
+            print(f"  === BOTTLENECK 1 ANALYSIS ===")
+            print(f"  Vision encoder probe: {mae:.2f}mm")
+            print(f"  Model output:         {output_mae:.2f}mm")
+            print(f"  Gap:                  {gap:.2f}mm")
+            print()
+            print(f"  Qwen2.5-VL-7B gap was: 3.41mm")
+            print(f"  Qwen3-VL-8B gap is:    {gap:.2f}mm")
             print()
             if gap > 2:
-                print(f"    → Large gap: bottleneck 1 EXISTS in Qwen3-VL")
-                print(f"    → The decoding problem persists despite DeepStack")
+                print(f"  → BOTTLENECK 1 EXISTS: decoding problem persists despite DeepStack")
             elif gap > 0.5:
-                print(f"    → Moderate gap: bottleneck 1 partially reduced")
-                print(f"    → DeepStack helps but doesn't fully solve decoding")
+                print(f"  → BOTTLENECK 1 REDUCED: DeepStack helps but doesn't fully solve it")
             else:
-                print(f"    → Small gap: bottleneck 1 mostly SOLVED")
-                print(f"    → Qwen3-VL decodes spatial info near probe ceiling")
+                print(f"  → BOTTLENECK 1 MOSTLY SOLVED: Qwen3-VL decodes near probe ceiling")
 
     # Save probe results
     probe_results = {
