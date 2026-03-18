@@ -1,0 +1,7 @@
+{
+  "model": "Qwen/Qwen3-VL-8B-Instruct",
+  "embedding_dim": 4096,
+  "probe_mae_mm": 4.22,
+  "probe_mae_std": 0.74,
+  "probe_r2": 0.728
+}
