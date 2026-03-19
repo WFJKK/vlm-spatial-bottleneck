@@ -1,15 +1,11 @@
-"""Evaluation for spatial measurement experiments.
+"""Evaluation pipeline for spatial measurement experiments.
 
-Supports baseline, SFT, GRPO, and CoT GRPO evaluations.
-Results saved to results/<tag>/ for comparison.
-
-Usage:
-    python3 evaluate.py --baseline
-    python3 evaluate.py --checkpoint-dir checkpoints/final --tag grpo_answer
-    python3 evaluate.py --checkpoint-dir checkpoints_sft/final --tag sft
-    python3 evaluate.py --checkpoint-dir checkpoints_cot/final --tag grpo_cot
-    python3 evaluate.py --compare
+Runs inference on the test set and matched pair diagnostic, computes
+metrics (MAE, parse rate, scale bar usage), and supports comparison
+across multiple checkpoints.
 """
+
+from __future__ import annotations
 
 import argparse
 import json
@@ -17,25 +13,26 @@ import os
 import re
 import time
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
 from PIL import Image
 
-DATASET_DIR = "dataset"
-RESULTS_DIR = "results"
-MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
+DATASET_DIR: str = "dataset"
+RESULTS_DIR: str = "results"
+MODEL_ID: str = "Qwen/Qwen2.5-VL-7B-Instruct"
 
-SYSTEM_PROMPT = (
+SYSTEM_PROMPT: str = (
     "You are measuring a hole in a technical drawing. "
     "Use the scale bar to determine the diameter. "
     "Respond with ONLY the diameter in mm as a number, nothing else."
 )
-USER_PROMPT = "What is the diameter of hole H1 in mm?"
+USER_PROMPT: str = "What is the diameter of hole H1 in mm?"
 
 
-def parse_number(text):
-    """Extract numeric value from model output (answer-only or final number in CoT)."""
+def parse_number(text: str) -> float | None:
+    """Extract a numeric value from model output, handling both answer-only and CoT formats."""
     text = text.strip()
     match = re.search(r'ANSWER:\s*(\d+\.?\d*)', text, re.IGNORECASE)
     if match:
@@ -50,12 +47,14 @@ def parse_number(text):
     return None
 
 
-def load_model(checkpoint_dir=None, sft_base=None):
-    """Load model with optional LoRA adapter.
-    
-    Args:
-        checkpoint_dir: Path to LoRA adapter to evaluate
-        sft_base: Path to SFT adapter to merge first (for SFT→RL evals)
+def load_model(
+    checkpoint_dir: str | None = None,
+    sft_base: str | None = None,
+) -> tuple[Any, Any]:
+    """Load Qwen2.5-VL with optional LoRA adapters.
+
+    For SFT→RL evaluation, pass sft_base to merge the SFT adapter
+    into the base model before loading the RL adapter on top.
     """
     from transformers import AutoModelForImageTextToText, AutoProcessor
 
@@ -64,14 +63,12 @@ def load_model(checkpoint_dir=None, sft_base=None):
         MODEL_ID, torch_dtype=torch.bfloat16, device_map={"": 0}, trust_remote_code=True,
     )
 
-    # For SFT→RL: merge SFT adapter into base first
     if sft_base and os.path.exists(sft_base):
         from peft import PeftModel
         print(f"Merging SFT base from {sft_base}")
         model = PeftModel.from_pretrained(model, sft_base)
         model = model.merge_and_unload()
 
-    # Apply evaluation adapter
     if checkpoint_dir and os.path.exists(checkpoint_dir):
         from peft import PeftModel
         print(f"Loading LoRA adapter from {checkpoint_dir}")
@@ -84,7 +81,8 @@ def load_model(checkpoint_dir=None, sft_base=None):
     return model, processor
 
 
-def run_inference(model, processor, image_path):
+def run_inference(model: Any, processor: Any, image_path: str) -> str:
+    """Run single-image inference and return decoded text."""
     image = Image.open(image_path).convert("RGB")
     messages = [{"role": "user", "content": [
         {"type": "image"},
@@ -100,12 +98,18 @@ def run_inference(model, processor, image_path):
     return processor.decode(output_ids[0][input_len:], skip_special_tokens=True).strip()
 
 
-def evaluate_test_set(model, processor, split="test", resume_path=None):
+def evaluate_test_set(
+    model: Any,
+    processor: Any,
+    split: str = "test",
+    resume_path: str | None = None,
+) -> dict[int, dict[str, Any]]:
+    """Run inference on all test images with optional resume support."""
     data_dir = Path(DATASET_DIR) / split
     with open(data_dir / "metadata.jsonl") as f:
         samples = [json.loads(l) for l in f]
 
-    results = {}
+    results: dict[int, dict[str, Any]] = {}
     if resume_path and os.path.exists(resume_path):
         with open(resume_path) as f:
             for line in f:
@@ -154,7 +158,8 @@ def evaluate_test_set(model, processor, split="test", resume_path=None):
     return results
 
 
-def evaluate_matched_pairs(model, processor):
+def evaluate_matched_pairs(model: Any, processor: Any) -> list[dict[str, Any]]:
+    """Run matched pair diagnostic: pixel-identical holes with different scale bars."""
     data_dir = Path(DATASET_DIR) / "test_matched"
     meta_path = data_dir / "metadata.jsonl"
     if not meta_path.exists():
@@ -164,7 +169,7 @@ def evaluate_matched_pairs(model, processor):
         pairs = [json.loads(l) for l in f]
 
     print(f"  Running matched pair diagnostic ({len(pairs)} pairs)...")
-    pair_results = []
+    pair_results: list[dict[str, Any]] = []
 
     for pair in pairs:
         pid = pair["pair_id"]
@@ -193,7 +198,8 @@ def evaluate_matched_pairs(model, processor):
     return pair_results
 
 
-def compute_metrics(results):
+def compute_metrics(results: dict[int, dict[str, Any]]) -> dict[str, Any]:
+    """Compute MAE, parse rate, scale-bar-stratified metrics from evaluation results."""
     valid = [r for r in results.values() if r["error_mm"] is not None]
     if not valid:
         return {"n_total": len(results), "n_parsed": 0}
@@ -201,7 +207,7 @@ def compute_metrics(results):
     errors = [r["error_mm"] for r in valid]
     rel_errors = [r["relative_error"] for r in valid]
 
-    metrics = {
+    metrics: dict[str, Any] = {
         "n_total": len(results), "n_parsed": len(valid),
         "parse_rate": len(valid) / len(results),
         "mae_mm": round(np.mean(errors), 3),
@@ -220,7 +226,8 @@ def compute_metrics(results):
     return metrics
 
 
-def compute_matched_metrics(pair_results):
+def compute_matched_metrics(pair_results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Compute correlation and same-answer rate from matched pair results."""
     if not pair_results:
         return {}
     valid = [p for p in pair_results if p["pred_diff"] is not None]
@@ -229,8 +236,15 @@ def compute_matched_metrics(pair_results):
 
     gt_diffs = [p["gt_diff"] for p in valid]
     pred_diffs = [p["pred_diff"] for p in valid]
-    corr = np.corrcoef(gt_diffs, pred_diffs)[0, 1] if len(valid) > 2 else 0
-    same_answer = np.mean([d < 1.0 for d in pred_diffs])
+    corr = float(np.corrcoef(gt_diffs, pred_diffs)[0, 1]) if len(valid) > 2 else 0.0
+    same_answer = float(np.mean([d < 1.0 for d in pred_diffs]))
+
+    if corr > 0.5:
+        interpretation = "USES scale bar"
+    elif corr > 0.2:
+        interpretation = "PARTIALLY uses scale bar"
+    else:
+        interpretation = "IGNORES scale bar"
 
     return {
         "n_pairs": len(pair_results), "n_valid": len(valid),
@@ -238,18 +252,19 @@ def compute_matched_metrics(pair_results):
         "pred_diff_mean": round(np.mean(pred_diffs), 2),
         "diff_correlation": round(corr, 4),
         "frac_same_answer": round(same_answer, 4),
-        "interpretation": (
-            "USES scale bar" if corr > 0.5
-            else "PARTIALLY uses scale bar" if corr > 0.2
-            else "IGNORES scale bar"
-        ),
+        "interpretation": interpretation,
     }
 
 
-def run_evaluation(checkpoint_dir, tag, sft_base=None):
-    print(f"\n{'='*60}")
+def run_evaluation(
+    checkpoint_dir: str | None,
+    tag: str,
+    sft_base: str | None = None,
+) -> None:
+    """Run full evaluation pipeline: test set + matched pairs + save results."""
+    print(f"\n{'=' * 60}")
     print(f"  Evaluation: {tag}")
-    print(f"{'='*60}\n")
+    print(f"{'=' * 60}\n")
 
     model, processor = load_model(checkpoint_dir, sft_base=sft_base)
 
@@ -286,16 +301,17 @@ def run_evaluation(checkpoint_dir, tag, sft_base=None):
     print(f"\n✓ Results saved to {results_dir}/")
 
 
-def compare_results():
+def compare_results() -> None:
+    """Print a comparison table across all evaluated checkpoints."""
     results_dir = Path(RESULTS_DIR)
     tags = sorted([d.name for d in results_dir.iterdir() if d.is_dir()])
     if not tags:
         print("No results found.")
         return
 
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print(f"  Comparison across {len(tags)} evaluations")
-    print(f"{'='*80}\n")
+    print(f"{'=' * 80}\n")
 
     print(f"{'Tag':<20} {'MAE':>8} {'Med.AE':>8} {'<1mm':>8} {'<2mm':>8} {'<5mm':>8} "
           f"{'Parse%':>8} {'Matched':>15}")
@@ -328,8 +344,8 @@ def compare_results():
           f"{'n/a':>8} {'USES':>15}")
 
 
-def main():
-    parser = argparse.ArgumentParser()
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Evaluate spatial measurement models")
     parser.add_argument("--baseline", action="store_true")
     parser.add_argument("--checkpoint-dir", type=str, default=None)
     parser.add_argument("--tag", type=str, default=None)

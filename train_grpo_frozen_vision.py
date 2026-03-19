@@ -10,6 +10,8 @@ Usage:
     python3 train_grpo_frozen_vision.py --resume
 """
 
+from __future__ import annotations
+
 import json, os, re, time, gc
 from pathlib import Path
 
@@ -19,7 +21,6 @@ from PIL import Image
 from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
-# ---- Config ----
 MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
 DATASET_DIR = "dataset"
 OUTPUT_DIR = "checkpoints_frozen_vision"

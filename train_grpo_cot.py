@@ -13,6 +13,8 @@ Usage:
     python3 train_grpo_cot.py --resume
 """
 
+from __future__ import annotations
+
 import json, os, re, time, gc
 from pathlib import Path
 
@@ -22,7 +24,6 @@ from PIL import Image
 from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
-# ---- Config ----
 MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
 DATASET_DIR = "dataset"
 OUTPUT_DIR = "checkpoints_cot"
@@ -100,7 +101,6 @@ def grpo_step(model, processor, optimizer, image_path, gt_mm):
     inputs = {k: v.to(model.device) for k, v in inputs.items()}
     input_len = inputs["input_ids"].shape[1]
 
-    # Step 1: Generate N completions (no grad)
     completions = []
     gen_ids_list = []
     model.eval()
@@ -116,13 +116,11 @@ def grpo_step(model, processor, optimizer, image_path, gt_mm):
         del outputs
     torch.cuda.empty_cache()
 
-    # Step 2: Rewards and advantages
     rewards = [compute_reward(c, gt_mm) for c in completions]
     mean_r = np.mean(rewards)
     std_r = np.std(rewards) + 1e-8
     advantages = [(r - mean_r) / std_r for r in rewards]
 
-    # Step 3: Per-completion backward (memory-safe)
     model.train()
     optimizer.zero_grad()
     total_loss_val = 0.0

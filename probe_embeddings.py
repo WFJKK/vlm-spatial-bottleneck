@@ -1,29 +1,25 @@
-"""Linear probing: did RL change the vision encoder or just the language model?
+"""Vision encoder probing: test whether training changes the vision encoder.
 
-Extracts patch embeddings from the vision encoder for each test image,
-then trains a linear probe to predict diameter. Compares probe accuracy
-across baseline, SFT, GRPO, and SFT→RL models.
+Extracts mean-pooled patch embeddings from the vision encoder's merger
+layer for each test image, then trains a linear probe (Ridge regression)
+to predict hole diameter. Compares probe accuracy across baseline, SFT,
+GRPO, and SFT→RL models.
 
-Two analyses:
-  1. Probe on each model's embeddings → predict ground truth
-     If GRPO probe > baseline probe: vision encoder improved
-     If equal: only language model changed
+Analysis 1: Probe each model's embeddings → predict ground truth.
+    If GRPO probe ≈ baseline probe: vision encoder unchanged, only LM changed.
 
-  2. Probe on BASE embeddings → predict each model's outputs
-     If base embeddings predict GRPO outputs well: spatial info was
-     already there, language model learned to use it
-     If poorly: vision encoder must have changed
-
-Usage:
-    python3 probe_embeddings.py --extract    # Extract embeddings (needs GPU)
-    python3 probe_embeddings.py --probe      # Train probes (CPU is fine)
-    python3 probe_embeddings.py --all        # Both
+Analysis 2: Probe BASE embeddings → predict each model's outputs.
+    If R² is high: base vision encoder already contains the information.
 """
 
+from __future__ import annotations
+
 import argparse
+import gc
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -31,28 +27,31 @@ from PIL import Image
 from sklearn.linear_model import Ridge
 from sklearn.model_selection import cross_val_score
 
-DATASET_DIR = "dataset"
-EMBEDDINGS_DIR = "embeddings"
-MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
+DATASET_DIR: str = "dataset"
+EMBEDDINGS_DIR: str = "embeddings"
+RESULTS_DIR: str = "results"
+MODEL_ID: str = "Qwen/Qwen2.5-VL-7B-Instruct"
 
-SYSTEM_PROMPT = (
+SYSTEM_PROMPT: str = (
     "You are measuring a hole in a technical drawing. "
     "Use the scale bar to determine the diameter. "
     "Respond with ONLY the diameter in mm as a number, nothing else."
 )
-USER_PROMPT = "What is the diameter of hole H1 in mm?"
+USER_PROMPT: str = "What is the diameter of hole H1 in mm?"
 
-# Models to probe (tag -> checkpoint_dir, sft_base)
-MODELS = {
-    "baseline": {"checkpoint": None, "sft_base": None},
-    "sft": {"checkpoint": "checkpoints_sft/final", "sft_base": None},
-    "grpo_answer": {"checkpoint": "checkpoints/final", "sft_base": None},
-    "sft_then_rl": {"checkpoint": "checkpoints_sft_rl/final", "sft_base": "checkpoints_sft/final"},
+MODELS: dict[str, dict[str, str | None]] = {
+    "baseline": {"checkpoint": None, "sft_base": None, "results_tag": "baseline"},
+    "sft": {"checkpoint": "checkpoints_sft/final", "sft_base": None, "results_tag": "sft"},
+    "grpo_answer": {"checkpoint": "checkpoints/final", "sft_base": None, "results_tag": "grpo_answer"},
+    "sft_then_rl": {"checkpoint": "checkpoints_sft_rl/final", "sft_base": "checkpoints_sft/final", "results_tag": "sft_then_rl"},
 }
 
 
-def load_model_for_probing(checkpoint=None, sft_base=None):
-    """Load model, return the full model + processor."""
+def load_model_for_probing(
+    checkpoint: str | None = None,
+    sft_base: str | None = None,
+) -> tuple[Any, Any]:
+    """Load model with optional LoRA adapters merged for embedding extraction."""
     from transformers import AutoModelForImageTextToText, AutoProcessor
 
     model = AutoModelForImageTextToText.from_pretrained(
@@ -73,11 +72,35 @@ def load_model_for_probing(checkpoint=None, sft_base=None):
     return model, processor
 
 
-def extract_vision_embeddings(model, processor, image_path):
-    """Extract patch embeddings from vision encoder before language model.
+def find_merger_module(model: Any) -> tuple[Any, str]:
+    """Auto-discover the vision merger module by searching the model tree."""
+    candidates = ["visual.merger", "model.visual.merger", "visual", "model.visual"]
 
-    Returns a 1D vector (mean-pooled over patches).
-    """
+    for path in candidates:
+        module = model
+        try:
+            for attr in path.split("."):
+                module = getattr(module, attr)
+            print(f"  Found vision merger at: {path}")
+            return module, path
+        except AttributeError:
+            continue
+
+    for name, module in model.named_modules():
+        if "merger" in name.lower():
+            print(f"  Found merger module at: {name}")
+            return module, name
+
+    raise RuntimeError("Could not find vision merger module")
+
+
+def extract_vision_embeddings(
+    model: Any,
+    processor: Any,
+    image_path: str,
+    merger_module: Any,
+) -> np.ndarray:
+    """Extract mean-pooled patch embeddings from the vision encoder merger layer."""
     image = Image.open(image_path).convert("RGB")
     messages = [{"role": "user", "content": [
         {"type": "image"},
@@ -86,40 +109,20 @@ def extract_vision_embeddings(model, processor, image_path):
     text = processor.apply_chat_template(messages, add_generation_prompt=True)
     inputs = processor(text=[text], images=[image], return_tensors="pt").to(model.device)
 
-    # Hook into the vision encoder output
-    vision_output = {}
+    vision_output: dict[str, torch.Tensor] = {}
 
-    def hook_fn(module, input, output):
-        # Qwen2.5-VL: visual encoder outputs image features
+    def hook_fn(module: Any, input: Any, output: Any) -> None:
         if isinstance(output, tuple):
-            vision_output["features"] = output[0].detach().cpu()
-        else:
-            vision_output["features"] = output.detach().cpu()
+            vision_output["features"] = output[0].detach().cpu().float()
+        elif isinstance(output, torch.Tensor):
+            vision_output["features"] = output.detach().cpu().float()
 
-    # Find the vision encoder's final layer
-    # Qwen2.5-VL structure: model.visual.merger or model.visual
-    hook_handle = None
-    if hasattr(model, 'visual'):
-        # Hook the merger (projects vision features to language model dimension)
-        if hasattr(model.visual, 'merger'):
-            hook_handle = model.visual.merger.register_forward_hook(hook_fn)
-        else:
-            hook_handle = model.visual.register_forward_hook(hook_fn)
-    elif hasattr(model, 'model') and hasattr(model.model, 'visual'):
-        if hasattr(model.model.visual, 'merger'):
-            hook_handle = model.model.visual.merger.register_forward_hook(hook_fn)
-        else:
-            hook_handle = model.model.visual.register_forward_hook(hook_fn)
-
-    if hook_handle is None:
-        raise RuntimeError("Could not find vision encoder to hook")
+    hook_handle = merger_module.register_forward_hook(hook_fn)
 
     with torch.no_grad():
-        # Just run the forward pass far enough to trigger the vision encoder
         try:
             model.generate(**inputs, max_new_tokens=1)
         except Exception:
-            # Even if generation fails, the hook should have fired
             pass
 
     hook_handle.remove()
@@ -128,29 +131,24 @@ def extract_vision_embeddings(model, processor, image_path):
         raise RuntimeError("Hook did not capture vision features")
 
     features = vision_output["features"]
-    # Mean pool over patch dimension
     if features.dim() == 3:
-        # [batch, n_patches, hidden_dim]
         pooled = features[0].mean(dim=0)
     elif features.dim() == 2:
-        # [n_patches, hidden_dim]
         pooled = features.mean(dim=0)
     else:
         pooled = features.flatten()
 
-    return pooled.float().numpy()
+    return pooled.numpy()
 
 
-def extract_all_embeddings():
-    """Extract embeddings for all test images, all models."""
+def extract_all_embeddings() -> None:
+    """Extract embeddings for all test images across all model variants."""
     os.makedirs(EMBEDDINGS_DIR, exist_ok=True)
 
-    # Load test metadata
     meta_path = Path(DATASET_DIR) / "test" / "metadata.jsonl"
     with open(meta_path) as f:
         samples = [json.loads(l) for l in f]
 
-    # Save ground truth
     gt = {s["idx"]: s["diameter_mm"] for s in samples}
     np.save(os.path.join(EMBEDDINGS_DIR, "ground_truth.npy"), gt)
 
@@ -163,58 +161,52 @@ def extract_all_embeddings():
         ckpt = config["checkpoint"]
         sft_base = config["sft_base"]
 
-        # Check if checkpoint exists
         if ckpt and not os.path.exists(ckpt):
             print(f"  {tag}: checkpoint {ckpt} not found, skipping")
             continue
 
         print(f"\n  Extracting embeddings for: {tag}")
         model, processor = load_model_for_probing(ckpt, sft_base)
+        merger_module, _ = find_merger_module(model)
 
-        embeddings = []
+        embeddings: list[np.ndarray] = []
         for i, sample in enumerate(samples):
             image_path = str(Path(DATASET_DIR) / "test" / f"image_{sample['idx']:04d}.png")
             try:
-                emb = extract_vision_embeddings(model, processor, image_path)
+                emb = extract_vision_embeddings(model, processor, image_path, merger_module)
                 embeddings.append(emb)
             except Exception as e:
                 print(f"    Image {sample['idx']}: ERROR {e}")
-                embeddings.append(np.zeros_like(embeddings[-1]) if embeddings else np.zeros(1024))
+                if embeddings:
+                    embeddings.append(np.zeros_like(embeddings[-1]))
+                else:
+                    print(f"    First image failed, skipping model {tag}")
+                    break
 
             if (i + 1) % 50 == 0:
-                print(f"    {i+1}/{len(samples)}")
+                print(f"    {i + 1}/{len(samples)}")
 
-        embeddings = np.stack(embeddings)
-        np.save(out_path, embeddings)
-        print(f"  Saved {tag}: {embeddings.shape}")
+        if len(embeddings) == len(samples):
+            stacked = np.stack(embeddings)
+            np.save(out_path, stacked)
+            print(f"  Saved {tag}: {stacked.shape}")
 
-        # Free GPU memory for next model
         del model
         torch.cuda.empty_cache()
-        import gc
         gc.collect()
 
 
-def run_probes():
-    """Train linear probes and report results."""
-    # Load ground truth
+def run_probes() -> None:
+    """Train linear probes and print comparison across model variants."""
     gt_data = np.load(os.path.join(EMBEDDINGS_DIR, "ground_truth.npy"), allow_pickle=True).item()
     gt = np.array([gt_data[i] for i in sorted(gt_data.keys())])
 
-    # Also load model predictions for analysis 2
-    predictions = {}
-    for tag in MODELS:
-        results_path = None
-        if tag == "baseline":
-            results_path = "results/baseline/test_results.json"
-        elif tag == "sft":
-            results_path = "results/sft/test_results.json"
-        elif tag == "grpo_answer":
-            results_path = "results/grpo_answer/test_results.json"
-        elif tag == "sft_then_rl":
-            results_path = "results/sft_then_rl/test_results.json"
+    predictions: dict[str, np.ndarray] = {}
+    for tag, config in MODELS.items():
+        results_tag = config["results_tag"]
+        results_path = f"{RESULTS_DIR}/{results_tag}/test_results.json"
 
-        if results_path and os.path.exists(results_path):
+        if os.path.exists(results_path):
             with open(results_path) as f:
                 data = json.loads(f.read())
             preds = {r["idx"]: r["predicted_mm"] for r in data if r["predicted_mm"]}
@@ -226,7 +218,7 @@ def run_probes():
     print("=" * 70)
     print()
 
-    results = {}
+    probe_results: dict[str, dict[str, float]] = {}
     for tag in MODELS:
         emb_path = os.path.join(EMBEDDINGS_DIR, f"{tag}.npy")
         if not os.path.exists(emb_path):
@@ -234,30 +226,27 @@ def run_probes():
             continue
 
         X = np.load(emb_path)
-
-        # Ridge regression with cross-validation
         probe = Ridge(alpha=1.0)
         scores = cross_val_score(probe, X, gt, cv=5, scoring="neg_mean_absolute_error")
         mae = -scores.mean()
         mae_std = scores.std()
 
-        # Also fit on all data for R²
         probe.fit(X, gt)
         r2 = probe.score(X, gt)
 
-        results[tag] = {"mae": mae, "mae_std": mae_std, "r2": r2}
+        probe_results[tag] = {"mae": mae, "mae_std": mae_std, "r2": r2}
         print(f"  {tag:20s}: probe MAE = {mae:.2f}mm (±{mae_std:.2f})  R² = {r2:.3f}")
 
     print()
-    if "baseline" in results and "grpo_answer" in results:
-        diff = results["baseline"]["mae"] - results["grpo_answer"]["mae"]
-        if diff > 0.5:
-            print("  → GRPO improved vision encoder representations (probe MAE lower)")
-        elif diff < -0.5:
-            print("  → GRPO did NOT improve vision encoder (probe MAE higher)")
-        else:
+    if "baseline" in probe_results and "grpo_answer" in probe_results:
+        diff = probe_results["baseline"]["mae"] - probe_results["grpo_answer"]["mae"]
+        if abs(diff) < 0.5:
             print("  → Vision encoder representations similar (difference < 0.5mm)")
             print("  → RL likely only changed language model's use of existing features")
+        elif diff > 0:
+            print("  → GRPO improved vision encoder representations (probe MAE lower)")
+        else:
+            print("  → GRPO did NOT improve vision encoder (probe MAE higher)")
 
     print()
     print("=" * 70)
@@ -273,28 +262,36 @@ def run_probes():
 
     X_base = np.load(base_emb_path)
 
+    pred_probe_results: dict[str, dict[str, float]] = {}
     for tag, preds in predictions.items():
         valid = ~np.isnan(preds)
         if valid.sum() < 50:
             continue
 
         probe = Ridge(alpha=1.0)
-        scores = cross_val_score(probe, X_base[valid], preds[valid], cv=5,
-                                 scoring="neg_mean_absolute_error")
+        scores = cross_val_score(
+            probe, X_base[valid], preds[valid], cv=5, scoring="neg_mean_absolute_error"
+        )
         mae = -scores.mean()
 
         probe.fit(X_base[valid], preds[valid])
         r2 = probe.score(X_base[valid], preds[valid])
 
+        pred_probe_results[tag] = {"mae": mae, "r2": r2}
         print(f"  base embeddings → {tag:20s} outputs: MAE = {mae:.2f}mm  R² = {r2:.3f}")
 
     print()
     print("  If R² is high: base embeddings already contain the info, model learned to use it")
-    print("  If R² is low: model's outputs depend on changed embeddings")
+    print("  If R² is low: model's outputs depend on changed vision encoder representations")
+
+    all_results = {"analysis1_gt_probe": probe_results, "analysis2_pred_probe": pred_probe_results}
+    with open(os.path.join(EMBEDDINGS_DIR, "probe_results.json"), "w") as f:
+        json.dump(all_results, f, indent=2, default=float)
+    print(f"\n  Probe results saved to {EMBEDDINGS_DIR}/probe_results.json")
 
 
-def main():
-    parser = argparse.ArgumentParser()
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Vision encoder probing analysis")
     parser.add_argument("--extract", action="store_true", help="Extract embeddings (GPU)")
     parser.add_argument("--probe", action="store_true", help="Train probes (CPU)")
     parser.add_argument("--all", action="store_true", help="Both extract and probe")

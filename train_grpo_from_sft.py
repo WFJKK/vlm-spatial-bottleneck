@@ -11,6 +11,8 @@ Usage:
     python3 train_grpo_from_sft.py --resume
 """
 
+from __future__ import annotations
+
 import json, os, re, time, gc
 from pathlib import Path
 
@@ -20,7 +22,6 @@ from PIL import Image
 from peft import LoraConfig, get_peft_model, PeftModel
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
-# ---- Config ----
 MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
 SFT_CHECKPOINT = "checkpoints_sft/final"
 DATASET_DIR = "dataset"

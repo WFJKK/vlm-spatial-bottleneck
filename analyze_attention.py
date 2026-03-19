@@ -14,6 +14,8 @@ Usage:
     python3 analyze_attention.py --all        # Both
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os

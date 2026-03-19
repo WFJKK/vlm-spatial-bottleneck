@@ -17,6 +17,8 @@ Usage:
     python3 eval_qwen3vl.py --all        # Both
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os

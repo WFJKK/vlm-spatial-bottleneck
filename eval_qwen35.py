@@ -22,6 +22,8 @@ Usage:
     python3 eval_qwen35.py --all         # Both
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -372,7 +374,7 @@ def run_probe():
     print(f"  Probing {len(layer_indices)} layers: {layer_indices}")
 
     # Extract embeddings per layer for all test images
-    # Use only 100 images to save memory (hidden states for all layers are large)
+  
     n_probe_images = min(100, len(samples))
     print(f"\n  Extracting embeddings for {n_probe_images} images across {len(layer_indices)} layers...")
 

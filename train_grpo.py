@@ -13,6 +13,8 @@ Usage:
     python3 train_grpo.py --test-reward      # Test reward function only (no GPU)
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -29,7 +31,6 @@ import numpy as np
 # from PIL import Image as PILImage
 
 
-# ---- Configuration ----
 
 MODEL_ID = "mistralai/Ministral-3-8B-Instruct-2512"
 # For faster iteration on smaller GPU: "mistralai/Ministral-3B-Instruct-2501"
@@ -55,7 +56,6 @@ LOGGING_STEPS = 10
 REWARD_CLIP_MIN = -5.0       # Floor for very bad answers
 
 
-# ---- Prompt template ----
 
 SYSTEM_PROMPT = (
     "You are measuring a hole in a technical drawing. "
@@ -79,7 +79,6 @@ def build_prompt(image_path: str) -> list[dict]:
     ]
 
 
-# ---- Reward function ----
 
 def parse_number(text: str) -> float | None:
     """Extract a numeric value from model output.
@@ -154,7 +153,6 @@ def reward_function(completions: list[str], ground_truth_mm: list[float], **kwar
     return rewards
 
 
-# ---- Dataset loading ----
 
 def load_dataset_from_dir(split: str = "train") -> "Dataset":
     """Load generated dataset into HuggingFace Dataset format."""
@@ -189,7 +187,6 @@ def load_dataset_from_dir(split: str = "train") -> "Dataset":
     return Dataset.from_list(records)
 
 
-# ---- Test reward function ----
 
 def test_reward():
     """Quick test of the reward function without GPU."""
@@ -246,7 +243,6 @@ def test_reward():
     print("\n✓ Reward function tests passed")
 
 
-# ---- Training ----
 
 def train(resume: bool = False):
     """Run GRPO training."""
@@ -363,7 +359,6 @@ def train(resume: bool = False):
     print(f"\n✓ Training complete. Final model saved to {final_path}")
 
 
-# ---- Main ----
 
 def main():
     parser = argparse.ArgumentParser(description="GRPO training for spatial measurement")
